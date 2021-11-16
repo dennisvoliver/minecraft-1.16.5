@@ -1,0 +1,746 @@
+package net.minecraft.client.gui.screen.ingame;
+
+import com.google.common.collect.Lists;
+import com.mojang.blaze3d.platform.GlStateManager;
+import com.mojang.blaze3d.systems.RenderSystem;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.ListIterator;
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.SharedConstants;
+import net.minecraft.client.font.TextHandler;
+import net.minecraft.client.font.TextRenderer;
+import net.minecraft.client.gui.DrawableHelper;
+import net.minecraft.client.gui.Element;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.screen.ScreenTexts;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.PageTurnWidget;
+import net.minecraft.client.render.BufferBuilder;
+import net.minecraft.client.render.Tessellator;
+import net.minecraft.client.render.VertexFormats;
+import net.minecraft.client.util.NarratorManager;
+import net.minecraft.client.util.SelectionManager;
+import net.minecraft.client.util.math.MatrixStack;
+import net.minecraft.client.util.math.Rect2i;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.ItemStack;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtList;
+import net.minecraft.nbt.NbtString;
+import net.minecraft.network.packet.c2s.play.BookUpdateC2SPacket;
+import net.minecraft.text.LiteralText;
+import net.minecraft.text.OrderedText;
+import net.minecraft.text.StringVisitable;
+import net.minecraft.text.Style;
+import net.minecraft.text.Text;
+import net.minecraft.text.TranslatableText;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.Hand;
+import net.minecraft.util.Util;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.mutable.MutableBoolean;
+import org.apache.commons.lang3.mutable.MutableInt;
+import org.jetbrains.annotations.Nullable;
+
+@Environment(EnvType.CLIENT)
+public class BookEditScreen extends Screen {
+   private static final Text EDIT_TITLE_TEXT = new TranslatableText("book.editTitle");
+   private static final Text FINALIZE_WARNING_TEXT = new TranslatableText("book.finalizeWarning");
+   private static final OrderedText BLACK_CURSOR_TEXT;
+   private static final OrderedText GRAY_CURSOR_TEXT;
+   private final PlayerEntity player;
+   private final ItemStack itemStack;
+   private boolean dirty;
+   private boolean signing;
+   private int tickCounter;
+   private int currentPage;
+   private final List<String> pages = Lists.newArrayList();
+   private String title = "";
+   private final SelectionManager currentPageSelectionManager = new SelectionManager(this::getCurrentPageContent, this::setPageContent, this::getClipboard, this::setClipboard, (string) -> {
+      return string.length() < 1024 && this.textRenderer.getWrappedLinesHeight(string, 114) <= 128;
+   });
+   private final SelectionManager bookTitleSelectionManager = new SelectionManager(() -> {
+      return this.title;
+   }, (string) -> {
+      this.title = string;
+   }, this::getClipboard, this::setClipboard, (string) -> {
+      return string.length() < 16;
+   });
+   private long lastClickTime;
+   private int lastClickIndex = -1;
+   private PageTurnWidget nextPageButton;
+   private PageTurnWidget previousPageButton;
+   private ButtonWidget doneButton;
+   private ButtonWidget signButton;
+   private ButtonWidget finalizeButton;
+   private ButtonWidget cancelButton;
+   private final Hand hand;
+   @Nullable
+   private BookEditScreen.PageContent pageContent;
+   private Text pageIndicatorText;
+   private final Text signedByText;
+
+   public BookEditScreen(PlayerEntity player, ItemStack itemStack, Hand hand) {
+      super(NarratorManager.EMPTY);
+      this.pageContent = BookEditScreen.PageContent.EMPTY;
+      this.pageIndicatorText = LiteralText.EMPTY;
+      this.player = player;
+      this.itemStack = itemStack;
+      this.hand = hand;
+      NbtCompound nbtCompound = itemStack.getTag();
+      if (nbtCompound != null) {
+         NbtList nbtList = nbtCompound.getList("pages", 8).copy();
+
+         for(int i = 0; i < nbtList.size(); ++i) {
+            this.pages.add(nbtList.getString(i));
+         }
+      }
+
+      if (this.pages.isEmpty()) {
+         this.pages.add("");
+      }
+
+      this.signedByText = (new TranslatableText("book.byAuthor", new Object[]{player.getName()})).formatted(Formatting.DARK_GRAY);
+   }
+
+   private void setClipboard(String clipboard) {
+      if (this.client != null) {
+         SelectionManager.setClipboard(this.client, clipboard);
+      }
+
+   }
+
+   private String getClipboard() {
+      return this.client != null ? SelectionManager.getClipboard(this.client) : "";
+   }
+
+   private int countPages() {
+      return this.pages.size();
+   }
+
+   public void tick() {
+      super.tick();
+      ++this.tickCounter;
+   }
+
+   protected void init() {
+      this.invalidatePageContent();
+      this.client.keyboard.setRepeatEvents(true);
+      this.signButton = (ButtonWidget)this.addButton(new ButtonWidget(this.width / 2 - 100, 196, 98, 20, new TranslatableText("book.signButton"), (buttonWidget) -> {
+         this.signing = true;
+         this.updateButtons();
+      }));
+      this.doneButton = (ButtonWidget)this.addButton(new ButtonWidget(this.width / 2 + 2, 196, 98, 20, ScreenTexts.DONE, (buttonWidget) -> {
+         this.client.openScreen((Screen)null);
+         this.finalizeBook(false);
+      }));
+      this.finalizeButton = (ButtonWidget)this.addButton(new ButtonWidget(this.width / 2 - 100, 196, 98, 20, new TranslatableText("book.finalizeButton"), (buttonWidget) -> {
+         if (this.signing) {
+            this.finalizeBook(true);
+            this.client.openScreen((Screen)null);
+         }
+
+      }));
+      this.cancelButton = (ButtonWidget)this.addButton(new ButtonWidget(this.width / 2 + 2, 196, 98, 20, ScreenTexts.CANCEL, (buttonWidget) -> {
+         if (this.signing) {
+            this.signing = false;
+         }
+
+         this.updateButtons();
+      }));
+      int i = (this.width - 192) / 2;
+      int j = true;
+      this.nextPageButton = (PageTurnWidget)this.addButton(new PageTurnWidget(i + 116, 159, true, (buttonWidget) -> {
+         this.openNextPage();
+      }, true));
+      this.previousPageButton = (PageTurnWidget)this.addButton(new PageTurnWidget(i + 43, 159, false, (buttonWidget) -> {
+         this.openPreviousPage();
+      }, true));
+      this.updateButtons();
+   }
+
+   private void openPreviousPage() {
+      if (this.currentPage > 0) {
+         --this.currentPage;
+      }
+
+      this.updateButtons();
+      this.changePage();
+   }
+
+   private void openNextPage() {
+      if (this.currentPage < this.countPages() - 1) {
+         ++this.currentPage;
+      } else {
+         this.appendNewPage();
+         if (this.currentPage < this.countPages() - 1) {
+            ++this.currentPage;
+         }
+      }
+
+      this.updateButtons();
+      this.changePage();
+   }
+
+   public void removed() {
+      this.client.keyboard.setRepeatEvents(false);
+   }
+
+   private void updateButtons() {
+      this.previousPageButton.visible = !this.signing && this.currentPage > 0;
+      this.nextPageButton.visible = !this.signing;
+      this.doneButton.visible = !this.signing;
+      this.signButton.visible = !this.signing;
+      this.cancelButton.visible = this.signing;
+      this.finalizeButton.visible = this.signing;
+      this.finalizeButton.active = !this.title.trim().isEmpty();
+   }
+
+   private void removeEmptyPages() {
+      ListIterator listIterator = this.pages.listIterator(this.pages.size());
+
+      while(listIterator.hasPrevious() && ((String)listIterator.previous()).isEmpty()) {
+         listIterator.remove();
+      }
+
+   }
+
+   private void finalizeBook(boolean signBook) {
+      if (this.dirty) {
+         this.removeEmptyPages();
+         NbtList nbtList = new NbtList();
+         this.pages.stream().map(NbtString::of).forEach(nbtList::add);
+         if (!this.pages.isEmpty()) {
+            this.itemStack.putSubTag("pages", nbtList);
+         }
+
+         if (signBook) {
+            this.itemStack.putSubTag("author", NbtString.of(this.player.getGameProfile().getName()));
+            this.itemStack.putSubTag("title", NbtString.of(this.title.trim()));
+         }
+
+         int i = this.hand == Hand.MAIN_HAND ? this.player.inventory.selectedSlot : 40;
+         this.client.getNetworkHandler().sendPacket(new BookUpdateC2SPacket(this.itemStack, signBook, i));
+      }
+   }
+
+   private void appendNewPage() {
+      if (this.countPages() < 100) {
+         this.pages.add("");
+         this.dirty = true;
+      }
+   }
+
+   public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+      if (super.keyPressed(keyCode, scanCode, modifiers)) {
+         return true;
+      } else if (this.signing) {
+         return this.keyPressedSignMode(keyCode, scanCode, modifiers);
+      } else {
+         boolean bl = this.keyPressedEditMode(keyCode, scanCode, modifiers);
+         if (bl) {
+            this.invalidatePageContent();
+            return true;
+         } else {
+            return false;
+         }
+      }
+   }
+
+   public boolean charTyped(char chr, int modifiers) {
+      if (super.charTyped(chr, modifiers)) {
+         return true;
+      } else if (this.signing) {
+         boolean bl = this.bookTitleSelectionManager.insert(chr);
+         if (bl) {
+            this.updateButtons();
+            this.dirty = true;
+            return true;
+         } else {
+            return false;
+         }
+      } else if (SharedConstants.isValidChar(chr)) {
+         this.currentPageSelectionManager.insert(Character.toString(chr));
+         this.invalidatePageContent();
+         return true;
+      } else {
+         return false;
+      }
+   }
+
+   private boolean keyPressedEditMode(int keyCode, int scanCode, int modifiers) {
+      if (Screen.isSelectAll(keyCode)) {
+         this.currentPageSelectionManager.selectAll();
+         return true;
+      } else if (Screen.isCopy(keyCode)) {
+         this.currentPageSelectionManager.copy();
+         return true;
+      } else if (Screen.isPaste(keyCode)) {
+         this.currentPageSelectionManager.paste();
+         return true;
+      } else if (Screen.isCut(keyCode)) {
+         this.currentPageSelectionManager.cut();
+         return true;
+      } else {
+         switch(keyCode) {
+         case 257:
+         case 335:
+            this.currentPageSelectionManager.insert("\n");
+            return true;
+         case 259:
+            this.currentPageSelectionManager.delete(-1);
+            return true;
+         case 261:
+            this.currentPageSelectionManager.delete(1);
+            return true;
+         case 262:
+            this.currentPageSelectionManager.moveCursor(1, Screen.hasShiftDown());
+            return true;
+         case 263:
+            this.currentPageSelectionManager.moveCursor(-1, Screen.hasShiftDown());
+            return true;
+         case 264:
+            this.moveDownLine();
+            return true;
+         case 265:
+            this.moveUpLine();
+            return true;
+         case 266:
+            this.previousPageButton.onPress();
+            return true;
+         case 267:
+            this.nextPageButton.onPress();
+            return true;
+         case 268:
+            this.moveToLineStart();
+            return true;
+         case 269:
+            this.moveToLineEnd();
+            return true;
+         default:
+            return false;
+         }
+      }
+   }
+
+   private void moveUpLine() {
+      this.moveVertically(-1);
+   }
+
+   private void moveDownLine() {
+      this.moveVertically(1);
+   }
+
+   private void moveVertically(int lines) {
+      int i = this.currentPageSelectionManager.getSelectionStart();
+      int j = this.getPageContent().getVerticalOffset(i, lines);
+      this.currentPageSelectionManager.moveCursorTo(j, Screen.hasShiftDown());
+   }
+
+   private void moveToLineStart() {
+      int i = this.currentPageSelectionManager.getSelectionStart();
+      int j = this.getPageContent().getLineStart(i);
+      this.currentPageSelectionManager.moveCursorTo(j, Screen.hasShiftDown());
+   }
+
+   private void moveToLineEnd() {
+      BookEditScreen.PageContent pageContent = this.getPageContent();
+      int i = this.currentPageSelectionManager.getSelectionStart();
+      int j = pageContent.getLineEnd(i);
+      this.currentPageSelectionManager.moveCursorTo(j, Screen.hasShiftDown());
+   }
+
+   private boolean keyPressedSignMode(int keyCode, int scanCode, int modifiers) {
+      switch(keyCode) {
+      case 257:
+      case 335:
+         if (!this.title.isEmpty()) {
+            this.finalizeBook(true);
+            this.client.openScreen((Screen)null);
+         }
+
+         return true;
+      case 259:
+         this.bookTitleSelectionManager.delete(-1);
+         this.updateButtons();
+         this.dirty = true;
+         return true;
+      default:
+         return false;
+      }
+   }
+
+   private String getCurrentPageContent() {
+      return this.currentPage >= 0 && this.currentPage < this.pages.size() ? (String)this.pages.get(this.currentPage) : "";
+   }
+
+   private void setPageContent(String newContent) {
+      if (this.currentPage >= 0 && this.currentPage < this.pages.size()) {
+         this.pages.set(this.currentPage, newContent);
+         this.dirty = true;
+         this.invalidatePageContent();
+      }
+
+   }
+
+   public void render(MatrixStack matrices, int mouseX, int mouseY, float delta) {
+      this.renderBackground(matrices);
+      this.setFocused((Element)null);
+      RenderSystem.color4f(1.0F, 1.0F, 1.0F, 1.0F);
+      this.client.getTextureManager().bindTexture(BookScreen.BOOK_TEXTURE);
+      int i = (this.width - 192) / 2;
+      int j = true;
+      this.drawTexture(matrices, i, 2, 0, 0, 192, 192);
+      int l;
+      int m;
+      if (this.signing) {
+         boolean bl = this.tickCounter / 6 % 2 == 0;
+         OrderedText orderedText = OrderedText.concat(OrderedText.styledForwardsVisitedString(this.title, Style.EMPTY), bl ? BLACK_CURSOR_TEXT : GRAY_CURSOR_TEXT);
+         int k = this.textRenderer.getWidth((StringVisitable)EDIT_TITLE_TEXT);
+         this.textRenderer.draw(matrices, (Text)EDIT_TITLE_TEXT, (float)(i + 36 + (114 - k) / 2), 34.0F, 0);
+         l = this.textRenderer.getWidth(orderedText);
+         this.textRenderer.draw(matrices, (OrderedText)orderedText, (float)(i + 36 + (114 - l) / 2), 50.0F, 0);
+         m = this.textRenderer.getWidth((StringVisitable)this.signedByText);
+         this.textRenderer.draw(matrices, (Text)this.signedByText, (float)(i + 36 + (114 - m) / 2), 60.0F, 0);
+         this.textRenderer.drawTrimmed(FINALIZE_WARNING_TEXT, i + 36, 82, 114, 0);
+      } else {
+         int n = this.textRenderer.getWidth((StringVisitable)this.pageIndicatorText);
+         this.textRenderer.draw(matrices, (Text)this.pageIndicatorText, (float)(i - n + 192 - 44), 18.0F, 0);
+         BookEditScreen.PageContent pageContent = this.getPageContent();
+         BookEditScreen.Line[] var15 = pageContent.lines;
+         l = var15.length;
+
+         for(m = 0; m < l; ++m) {
+            BookEditScreen.Line line = var15[m];
+            this.textRenderer.draw(matrices, line.text, (float)line.x, (float)line.y, -16777216);
+         }
+
+         this.drawSelection(pageContent.selectionRectangles);
+         this.drawCursor(matrices, pageContent.position, pageContent.atEnd);
+      }
+
+      super.render(matrices, mouseX, mouseY, delta);
+   }
+
+   private void drawCursor(MatrixStack matrices, BookEditScreen.Position position, boolean atEnd) {
+      if (this.tickCounter / 6 % 2 == 0) {
+         position = this.absolutePositionToScreenPosition(position);
+         if (!atEnd) {
+            int var10001 = position.x;
+            int var10002 = position.y - 1;
+            int var10003 = position.x + 1;
+            int var10004 = position.y;
+            this.textRenderer.getClass();
+            DrawableHelper.fill(matrices, var10001, var10002, var10003, var10004 + 9, -16777216);
+         } else {
+            this.textRenderer.draw(matrices, (String)"_", (float)position.x, (float)position.y, 0);
+         }
+      }
+
+   }
+
+   private void drawSelection(Rect2i[] selectionRectangles) {
+      Tessellator tessellator = Tessellator.getInstance();
+      BufferBuilder bufferBuilder = tessellator.getBuffer();
+      RenderSystem.color4f(0.0F, 0.0F, 255.0F, 255.0F);
+      RenderSystem.disableTexture();
+      RenderSystem.enableColorLogicOp();
+      RenderSystem.logicOp(GlStateManager.LogicOp.OR_REVERSE);
+      bufferBuilder.begin(7, VertexFormats.POSITION);
+      Rect2i[] var4 = selectionRectangles;
+      int var5 = selectionRectangles.length;
+
+      for(int var6 = 0; var6 < var5; ++var6) {
+         Rect2i rect2i = var4[var6];
+         int i = rect2i.getX();
+         int j = rect2i.getY();
+         int k = i + rect2i.getWidth();
+         int l = j + rect2i.getHeight();
+         bufferBuilder.vertex((double)i, (double)l, 0.0D).next();
+         bufferBuilder.vertex((double)k, (double)l, 0.0D).next();
+         bufferBuilder.vertex((double)k, (double)j, 0.0D).next();
+         bufferBuilder.vertex((double)i, (double)j, 0.0D).next();
+      }
+
+      tessellator.draw();
+      RenderSystem.disableColorLogicOp();
+      RenderSystem.enableTexture();
+   }
+
+   private BookEditScreen.Position screenPositionToAbsolutePosition(BookEditScreen.Position position) {
+      return new BookEditScreen.Position(position.x - (this.width - 192) / 2 - 36, position.y - 32);
+   }
+
+   private BookEditScreen.Position absolutePositionToScreenPosition(BookEditScreen.Position position) {
+      return new BookEditScreen.Position(position.x + (this.width - 192) / 2 + 36, position.y + 32);
+   }
+
+   public boolean mouseClicked(double mouseX, double mouseY, int button) {
+      if (super.mouseClicked(mouseX, mouseY, button)) {
+         return true;
+      } else {
+         if (button == 0) {
+            long l = Util.getMeasuringTimeMs();
+            BookEditScreen.PageContent pageContent = this.getPageContent();
+            int i = pageContent.getCursorPosition(this.textRenderer, this.screenPositionToAbsolutePosition(new BookEditScreen.Position((int)mouseX, (int)mouseY)));
+            if (i >= 0) {
+               if (i == this.lastClickIndex && l - this.lastClickTime < 250L) {
+                  if (!this.currentPageSelectionManager.isSelecting()) {
+                     this.selectCurrentWord(i);
+                  } else {
+                     this.currentPageSelectionManager.selectAll();
+                  }
+               } else {
+                  this.currentPageSelectionManager.moveCursorTo(i, Screen.hasShiftDown());
+               }
+
+               this.invalidatePageContent();
+            }
+
+            this.lastClickIndex = i;
+            this.lastClickTime = l;
+         }
+
+         return true;
+      }
+   }
+
+   private void selectCurrentWord(int cursor) {
+      String string = this.getCurrentPageContent();
+      this.currentPageSelectionManager.setSelection(TextHandler.moveCursorByWords(string, -1, cursor, false), TextHandler.moveCursorByWords(string, 1, cursor, false));
+   }
+
+   public boolean mouseDragged(double mouseX, double mouseY, int button, double deltaX, double deltaY) {
+      if (super.mouseDragged(mouseX, mouseY, button, deltaX, deltaY)) {
+         return true;
+      } else {
+         if (button == 0) {
+            BookEditScreen.PageContent pageContent = this.getPageContent();
+            int i = pageContent.getCursorPosition(this.textRenderer, this.screenPositionToAbsolutePosition(new BookEditScreen.Position((int)mouseX, (int)mouseY)));
+            this.currentPageSelectionManager.moveCursorTo(i, true);
+            this.invalidatePageContent();
+         }
+
+         return true;
+      }
+   }
+
+   private BookEditScreen.PageContent getPageContent() {
+      if (this.pageContent == null) {
+         this.pageContent = this.createPageContent();
+         this.pageIndicatorText = new TranslatableText("book.pageIndicator", new Object[]{this.currentPage + 1, this.countPages()});
+      }
+
+      return this.pageContent;
+   }
+
+   private void invalidatePageContent() {
+      this.pageContent = null;
+   }
+
+   private void changePage() {
+      this.currentPageSelectionManager.putCursorAtEnd();
+      this.invalidatePageContent();
+   }
+
+   private BookEditScreen.PageContent createPageContent() {
+      String string = this.getCurrentPageContent();
+      if (string.isEmpty()) {
+         return BookEditScreen.PageContent.EMPTY;
+      } else {
+         int i = this.currentPageSelectionManager.getSelectionStart();
+         int j = this.currentPageSelectionManager.getSelectionEnd();
+         IntList intList = new IntArrayList();
+         List<BookEditScreen.Line> list = Lists.newArrayList();
+         MutableInt mutableInt = new MutableInt();
+         MutableBoolean mutableBoolean = new MutableBoolean();
+         TextHandler textHandler = this.textRenderer.getTextHandler();
+         textHandler.wrapLines(string, 114, Style.EMPTY, true, (style, ix, jx) -> {
+            int k = mutableInt.getAndIncrement();
+            String string2 = string.substring(ix, jx);
+            mutableBoolean.setValue(string2.endsWith("\n"));
+            String string3 = StringUtils.stripEnd(string2, " \n");
+            this.textRenderer.getClass();
+            int l = k * 9;
+            BookEditScreen.Position position = this.absolutePositionToScreenPosition(new BookEditScreen.Position(0, l));
+            intList.add(ix);
+            list.add(new BookEditScreen.Line(style, string3, position.x, position.y));
+         });
+         int[] is = intList.toIntArray();
+         boolean bl = i == string.length();
+         BookEditScreen.Position position2;
+         int m;
+         if (bl && mutableBoolean.isTrue()) {
+            int var10003 = list.size();
+            this.textRenderer.getClass();
+            position2 = new BookEditScreen.Position(0, var10003 * 9);
+         } else {
+            int k = getLineFromOffset(is, i);
+            m = this.textRenderer.getWidth(string.substring(is[k], i));
+            this.textRenderer.getClass();
+            position2 = new BookEditScreen.Position(m, k * 9);
+         }
+
+         List<Rect2i> list2 = Lists.newArrayList();
+         if (i != j) {
+            m = Math.min(i, j);
+            int n = Math.max(i, j);
+            int o = getLineFromOffset(is, m);
+            int p = getLineFromOffset(is, n);
+            int q;
+            int t;
+            if (o == p) {
+               this.textRenderer.getClass();
+               q = o * 9;
+               t = is[o];
+               list2.add(this.getLineSelectionRectangle(string, textHandler, m, n, q, t));
+            } else {
+               q = o + 1 > is.length ? string.length() : is[o + 1];
+               this.textRenderer.getClass();
+               list2.add(this.getLineSelectionRectangle(string, textHandler, m, q, o * 9, is[o]));
+
+               for(t = o + 1; t < p; ++t) {
+                  this.textRenderer.getClass();
+                  int u = t * 9;
+                  String string2 = string.substring(is[t], is[t + 1]);
+                  int v = (int)textHandler.getWidth(string2);
+                  BookEditScreen.Position var10002 = new BookEditScreen.Position(0, u);
+                  this.textRenderer.getClass();
+                  list2.add(this.getRectFromCorners(var10002, new BookEditScreen.Position(v, u + 9)));
+               }
+
+               int var10004 = is[p];
+               this.textRenderer.getClass();
+               list2.add(this.getLineSelectionRectangle(string, textHandler, var10004, n, p * 9, is[p]));
+            }
+         }
+
+         return new BookEditScreen.PageContent(string, position2, bl, is, (BookEditScreen.Line[])list.toArray(new BookEditScreen.Line[0]), (Rect2i[])list2.toArray(new Rect2i[0]));
+      }
+   }
+
+   private static int getLineFromOffset(int[] lineStarts, int position) {
+      int i = Arrays.binarySearch(lineStarts, position);
+      return i < 0 ? -(i + 2) : i;
+   }
+
+   private Rect2i getLineSelectionRectangle(String string, TextHandler handler, int selectionStart, int selectionEnd, int lineY, int lineStart) {
+      String string2 = string.substring(lineStart, selectionStart);
+      String string3 = string.substring(lineStart, selectionEnd);
+      BookEditScreen.Position position = new BookEditScreen.Position((int)handler.getWidth(string2), lineY);
+      int var10002 = (int)handler.getWidth(string3);
+      this.textRenderer.getClass();
+      BookEditScreen.Position position2 = new BookEditScreen.Position(var10002, lineY + 9);
+      return this.getRectFromCorners(position, position2);
+   }
+
+   private Rect2i getRectFromCorners(BookEditScreen.Position start, BookEditScreen.Position end) {
+      BookEditScreen.Position position = this.absolutePositionToScreenPosition(start);
+      BookEditScreen.Position position2 = this.absolutePositionToScreenPosition(end);
+      int i = Math.min(position.x, position2.x);
+      int j = Math.max(position.x, position2.x);
+      int k = Math.min(position.y, position2.y);
+      int l = Math.max(position.y, position2.y);
+      return new Rect2i(i, k, j - i, l - k);
+   }
+
+   static {
+      BLACK_CURSOR_TEXT = OrderedText.styledForwardsVisitedString("_", Style.EMPTY.withColor(Formatting.BLACK));
+      GRAY_CURSOR_TEXT = OrderedText.styledForwardsVisitedString("_", Style.EMPTY.withColor(Formatting.GRAY));
+   }
+
+   @Environment(EnvType.CLIENT)
+   static class PageContent {
+      private static final BookEditScreen.PageContent EMPTY;
+      private final String pageContent;
+      private final BookEditScreen.Position position;
+      private final boolean atEnd;
+      private final int[] lineStarts;
+      private final BookEditScreen.Line[] lines;
+      private final Rect2i[] selectionRectangles;
+
+      public PageContent(String pageContent, BookEditScreen.Position position, boolean atEnd, int[] lineStarts, BookEditScreen.Line[] lines, Rect2i[] selectionRectangles) {
+         this.pageContent = pageContent;
+         this.position = position;
+         this.atEnd = atEnd;
+         this.lineStarts = lineStarts;
+         this.lines = lines;
+         this.selectionRectangles = selectionRectangles;
+      }
+
+      public int getCursorPosition(TextRenderer renderer, BookEditScreen.Position position) {
+         int var10000 = position.y;
+         renderer.getClass();
+         int i = var10000 / 9;
+         if (i < 0) {
+            return 0;
+         } else if (i >= this.lines.length) {
+            return this.pageContent.length();
+         } else {
+            BookEditScreen.Line line = this.lines[i];
+            return this.lineStarts[i] + renderer.getTextHandler().getTrimmedLength(line.content, position.x, line.style);
+         }
+      }
+
+      public int getVerticalOffset(int position, int lines) {
+         int i = BookEditScreen.getLineFromOffset(this.lineStarts, position);
+         int j = i + lines;
+         int n;
+         if (0 <= j && j < this.lineStarts.length) {
+            int k = position - this.lineStarts[i];
+            int l = this.lines[j].content.length();
+            n = this.lineStarts[j] + Math.min(k, l);
+         } else {
+            n = position;
+         }
+
+         return n;
+      }
+
+      public int getLineStart(int position) {
+         int i = BookEditScreen.getLineFromOffset(this.lineStarts, position);
+         return this.lineStarts[i];
+      }
+
+      public int getLineEnd(int position) {
+         int i = BookEditScreen.getLineFromOffset(this.lineStarts, position);
+         return this.lineStarts[i] + this.lines[i].content.length();
+      }
+
+      static {
+         EMPTY = new BookEditScreen.PageContent("", new BookEditScreen.Position(0, 0), true, new int[]{0}, new BookEditScreen.Line[]{new BookEditScreen.Line(Style.EMPTY, "", 0, 0)}, new Rect2i[0]);
+      }
+   }
+
+   @Environment(EnvType.CLIENT)
+   static class Line {
+      private final Style style;
+      private final String content;
+      private final Text text;
+      private final int x;
+      private final int y;
+
+      public Line(Style style, String content, int x, int y) {
+         this.style = style;
+         this.content = content;
+         this.x = x;
+         this.y = y;
+         this.text = (new LiteralText(content)).setStyle(style);
+      }
+   }
+
+   @Environment(EnvType.CLIENT)
+   static class Position {
+      public final int x;
+      public final int y;
+
+      Position(int x, int y) {
+         this.x = x;
+         this.y = y;
+      }
+   }
+}
